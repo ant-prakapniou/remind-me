@@ -1,0 +1,10 @@
+**/bin/
+**/obj/
+**/.vs/
+**/.vscode/
+**/appsettings.Development.json
+.git/
+tests/
+README.md
+LICENSE
+*.slnx
