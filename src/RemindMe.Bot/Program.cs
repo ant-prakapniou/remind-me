@@ -29,14 +29,12 @@ var noteStore = new NoteStore(notesPath);
 var userStore = new JsonLongSetStore(usersPath);
 var pendingStore = new JsonLongSetStore(pendingPath);
 var localTime = new LocalTime(offsetHours);
+var reminderService = new ReminderService(noteStore, localTime);
+var approvalService = new ApprovalService(userStore, pendingStore);
 var bot = new TelegramBotClient(botToken);
 
-var users = userStore.Load();
-if (!users.Contains(bootstrapAdminId))
-{
-    users.Add(bootstrapAdminId);
-    userStore.Save(users);
-}
+if (!approvalService.IsApproved(bootstrapAdminId))
+    approvalService.Approve(bootstrapAdminId);
 
 var me = await bot.GetMe();
 Console.WriteLine($"[INFO] Bot started: @{me.Username}");
@@ -51,16 +49,15 @@ while (true)
 
         if (update.CallbackQuery is { } callback)
         {
-            await HandleCallback(bot, userStore, pendingStore, bootstrapAdminId, callback);
+            await HandleCallback(bot, approvalService, bootstrapAdminId, callback);
             continue;
         }
 
         if (update.Message is not { From: { } from, Text: { } text }) continue;
 
-        var approved = userStore.Load();
-        if (!approved.Contains(from.Id))
+        if (!approvalService.IsApproved(from.Id))
         {
-            await HandleNewUser(bot, userStore, pendingStore, bootstrapAdminId, from.Id, text);
+            await HandleNewUser(bot, approvalService, bootstrapAdminId, from.Id, text);
             continue;
         }
 
@@ -86,12 +83,7 @@ while (true)
         {
             if (long.TryParse(text[7..].Trim(), out var newId))
             {
-                var u = userStore.Load();
-                var p = pendingStore.Load();
-                u.Add(newId);
-                p.Remove(newId);
-                userStore.Save(u);
-                pendingStore.Save(p);
+                approvalService.Approve(newId);
                 await bot.SendMessage(from.Id, Messages.ApprovedUser(newId));
             }
             else
@@ -101,24 +93,19 @@ while (true)
             continue;
         }
 
-        await HandleMessage(bot, noteStore, localTime, from.Id, text);
+        await HandleMessage(bot, reminderService, from.Id, text);
     }
 }
 
 static async Task HandleNewUser(
     TelegramBotClient bot,
-    JsonLongSetStore userStore,
-    JsonLongSetStore pendingStore,
+    ApprovalService approval,
     long adminId,
     long userId,
     string text)
 {
-    var pending = pendingStore.Load();
-    if (!pending.Contains(userId))
+    if (approval.RequestApproval(userId))
     {
-        pending.Add(userId);
-        pendingStore.Save(pending);
-
         var keyboard = new InlineKeyboardMarkup(new[]
         {
             new[]
@@ -139,8 +126,7 @@ static async Task HandleNewUser(
 
 static async Task HandleCallback(
     TelegramBotClient bot,
-    JsonLongSetStore userStore,
-    JsonLongSetStore pendingStore,
+    ApprovalService approval,
     long adminId,
     CallbackQuery callback)
 {
@@ -151,17 +137,11 @@ static async Task HandleCallback(
     if (parts.Length != 2 || !long.TryParse(parts[1], out var targetId)) return;
 
     var action = parts[0];
-    var pending = pendingStore.Load();
-    if (!pending.Contains(targetId)) return;
+    if (!approval.IsPending(targetId)) return;
 
     if (action == "approve")
     {
-        var users = userStore.Load();
-        users.Add(targetId);
-        pending.Remove(targetId);
-        userStore.Save(users);
-        pendingStore.Save(pending);
-
+        approval.Approve(targetId);
         await bot.SendMessage(targetId, Messages.Approved);
         await bot.AnswerCallbackQuery(callback.Id, $"Approved {targetId}");
         if (callback.Message is { } msg)
@@ -169,9 +149,7 @@ static async Task HandleCallback(
     }
     else if (action == "reject")
     {
-        pending.Remove(targetId);
-        pendingStore.Save(pending);
-
+        approval.Reject(targetId);
         await bot.SendMessage(targetId, Messages.Rejected);
         await bot.AnswerCallbackQuery(callback.Id, $"Rejected {targetId}");
         if (callback.Message is { } msg)
@@ -181,35 +159,17 @@ static async Task HandleCallback(
 
 static async Task HandleMessage(
     TelegramBotClient bot,
-    NoteStore store,
-    LocalTime localTime,
+    ReminderService reminderService,
     long userId,
     string input)
 {
-    string? message;
-    DateTime dtLocal;
     try
     {
-        (message, dtLocal) = DateTimeTailParser.Parse(input);
+        var reply = reminderService.Create(userId, input);
+        await bot.SendMessage(chatId: userId, text: reply);
     }
     catch (FormatException)
     {
         await bot.SendMessage(chatId: userId, text: Messages.ParseError);
-        return;
     }
-
-    var note = new Note
-    {
-        Id = Guid.NewGuid().ToString("N")[..8],
-        OwnerUserId = userId,
-        Text = message ?? string.Empty,
-        RemindAtUtc = localTime.ToUtc(dtLocal)
-    };
-
-    var notes = store.Load();
-    notes.Add(note);
-    store.Save(notes);
-
-    var when = dtLocal.ToString("yyyy-MM-dd HH:mm");
-    await bot.SendMessage(chatId: userId, text: Messages.ReminderSet(note.Text, when));
 }
