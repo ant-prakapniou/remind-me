@@ -20,13 +20,12 @@ Built as a personal project: small, understandable, easy to modify. No database,
 
 ## Architecture
 
-The solution has three projects:
+The solution has two active projects (plus tests):
 
 | Project | Purpose |
 |---|---|
 | `RemindMe.Core` | Domain logic: parsing, storage, services. No Telegram dependency. |
-| `RemindMe.Bot` | Telegram bot: receives messages, handles commands and approval callbacks. |
-| `RemindMe.Cron` | Short-lived process run on a schedule: sends due reminders, exits. |
+| `RemindMe.Bot` | Telegram bot: receives messages, handles commands and approval callbacks. **Also hosts the reminder delivery loop** via `CronRunner` (runs every minute inside the bot process). |
 
 Three JSON files live on a mounted volume (Railway /data):
 
@@ -42,7 +41,6 @@ remind-me/
   src/
     RemindMe.Core/
     RemindMe.Bot/
-    RemindMe.Cron/
   tests/
     RemindMe.Tests/
   README.md
@@ -108,22 +106,6 @@ All settings are read from `appsettings.json` (and appsettings.Development.json 
 }
 ```
 
-### `RemindMe.Cron/appsettings.json`
-
-```json
-{
-  "Telegram": {
-    "BotToken": ""
-  },
-  "Storage": {
-    "NotesFilePath": "/data/notes.json"
-  },
-  "LocalTime": {
-    "OffsetHours": 3
-  }
-}
-```
-
 | Key | Description |
 |---|---|
 | `Telegram:BotToken` | Bot token from [@BotFather](https://t.me/BotFather). |
@@ -167,35 +149,11 @@ All settings are read from `appsettings.json` (and appsettings.Development.json 
       }
 ```
 
-3. Create `src/RemindMe.Cron/appsettings.Development.json`:
-
-```json
-      {
-        "Telegram": {
-          "BotToken": "YOUR_BOT_TOKEN"
-        },
-        "Storage": {
-          "NotesFilePath": "D:\\data\\notes.json"
-        },
-        "LocalTime": {
-          "OffsetHours": 3
-        }
-      }
-```
-
 ### Run the bot
 
 ```bash
 dotnet run --project src/RemindMe.Bot
 ```
-
-### Run the cron job once
-
-```bash
-dotnet run --project src/RemindMe.Cron
-```
-
-It reads `notes.json`, sends due reminders, removes them, and exits.
 
 ### Run tests
 
@@ -207,13 +165,20 @@ dotnet test
 
 ## Deployment (Railway)
 
-Railway runs the bot as a long-lived service and the cron job as a scheduled task. Both must mount the same volume so they share `notes.json`.
+Railway runs the bot as a single long-lived service. The reminder delivery
+loop (`CronRunner`) runs **inside the bot process** on a 1-minute timer,
+because Railway volumes cannot be shared between services.
 
-Minimum cron interval on Railway is 5 minutes. This means reminders are delivered with a tolerance of up to ~5 minutes.
+**Why one service instead of two:** Railway attaches a volume to exactly one
+service. If the bot and the cron job were separate services, they would each
+get their own isolated disk and could not share `notes.json`. Running both in
+one process solves this without changing the storage layer.
 
-The cron process must exit after each run — otherwise Railway will skip the next scheduled invocation. This is why `RemindMe.Cron` is a plain console app that calls `Environment.Exit(0)`.
+The bot writes to `/data` (a mounted volume), which must be created in the
+Railway dashboard and attached to the `bot` service.
 
-See [Railway docs on cron jobs](https://docs.railway.com/reference/cron-jobs) for details.
+Reminders are delivered with a tolerance of **up to ~1 minute**, limited by
+the timer interval.
 
 ---
 
@@ -223,6 +188,9 @@ See [Railway docs on cron jobs](https://docs.railway.com/reference/cron-jobs) fo
 - **All times are stored in UTC.** Conversion to and from local time happens at the edges (bot input, cron output) via `LocalTime`.
 - **Storage is JSON on disk.** For a few hundred notes with a handful of users this is sufficient. If the bot ever grows beyond that, replace `NoteStore` with a SQLite-backed implementation — the rest of the code does not need to change.
 - **No DI, no logging framework, no web server.** Console output with `[INFO]` / `[WARN]` prefixes is enough; Railway collects it from stdout.
+- **Cron runs inside the bot.** `CronRunner.RunOnceAsync` is called every minute
+  by a `PeriodicTimer` in `Program.cs`. It has no `Environment.Exit`, and all
+  exceptions are caught so a failed delivery does not kill the bot.
 
 ---
 

@@ -1,4 +1,5 @@
 ﻿using Microsoft.Extensions.Configuration;
+using RemindMe.Bot;
 using RemindMe.Core;
 using Telegram.Bot;
 using Telegram.Bot.Types;
@@ -36,8 +37,21 @@ var bot = new TelegramBotClient(botToken);
 if (!approvalService.IsApproved(bootstrapAdminId))
     approvalService.Approve(bootstrapAdminId);
 
+var cronRunner = new CronRunner(noteStore, localTime, bot);
+
 var me = await bot.GetMe();
 Console.WriteLine($"[INFO] Bot started: @{me.Username}");
+
+// Start cron loop: run once every 5 minutes
+_ = Task.Run(async () =>
+{
+    using var timer = new PeriodicTimer(TimeSpan.FromMinutes(1));
+    while (await timer.WaitForNextTickAsync())
+    {
+        Console.WriteLine("[INFO] Cron tick.");
+        await cronRunner.RunOnceAsync();
+    }
+});
 
 var offset = 0;
 while (true)
