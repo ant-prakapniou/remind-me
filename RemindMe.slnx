@@ -1,0 +1,7 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/RemindMe.Bot/RemindMe.Bot.csproj" />
+    <Project Path="src/RemindMe.Core/RemindMe.Core.csproj" />
+    <Project Path="src/RemindMe.Cron/RemindMe.Cron.csproj" />
+  </Folder>
+</Solution>
