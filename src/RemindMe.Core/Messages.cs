@@ -58,4 +58,8 @@ public static class Messages
     public static string ApprovedUser(long userId) => $"Approved user {userId}.";
 
     public const string AllowUsage = "Usage: /allow <userId>";
+
+    public static string ReminderInPast(string when) =>
+        $"Could not set reminder: {when} is in the past.\n" +
+        "Please pick a future date and time.";
 }

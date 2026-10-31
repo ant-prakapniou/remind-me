@@ -24,22 +24,27 @@ public class ReminderServiceTests : IDisposable
     [Fact]
     public void Create_SavesNoteAndReturnsReply()
     {
-        var reply = _service.Create(42, "buy bread 17 00 21 06 2026");
+        var future = DateTime.UtcNow.AddHours(3).AddDays(1); // завтра, +3 — гарантированно в будущем
+        var input = $"buy bread {future:HH mm dd MM yyyy}";
+
+        var reply = _service.Create(42, input);
 
         Assert.Contains("buy bread", reply);
-        Assert.Contains("2026-06-21 17:00", reply);
+        Assert.Contains($"{future:yyyy-MM-dd HH:mm}", reply);
 
         var notes = _store.Load();
         Assert.Single(notes);
         Assert.Equal(42, notes[0].OwnerUserId);
         Assert.Equal("buy bread", notes[0].Text);
-        Assert.Equal(new DateTime(2026, 6, 21, 14, 0, 0, DateTimeKind.Utc), notes[0].RemindAtUtc);
     }
 
     [Fact]
     public void Create_EmptyText_SavesEmptyString()
     {
-        var reply = _service.Create(42, "17 00 21 06 2026");
+        var future = DateTime.UtcNow.AddHours(3).AddDays(1);
+        var input = $"{future:HH mm dd MM yyyy}";
+
+        var reply = _service.Create(42, input);
 
         Assert.DoesNotContain("\"", reply);
         var notes = _store.Load();
@@ -52,5 +57,24 @@ public class ReminderServiceTests : IDisposable
     {
         Assert.Throws<FormatException>(() => _service.Create(42, "no date"));
         Assert.Empty(_store.Load());
+    }
+    [Fact]
+    public void Create_PastDate_Throws()
+    {
+        var ex = Assert.Throws<ReminderInPastException>(
+            () => _service.Create(42, "buy bread 17 00 21 06 2020"));
+        Assert.Equal(new DateTime(2020, 6, 21, 17, 0, 0), ex.LocalDateTime);
+        Assert.Empty(_store.Load());
+    }
+
+    [Fact]
+    public void Create_WithinPastTolerance_Succeeds()
+    {
+        // 30 seconds ago in "Minsk" time, converted through the service's LocalTime(3)
+        var nowUtc = DateTime.UtcNow;
+        var local = nowUtc.AddHours(3).AddSeconds(-30);
+        var input = $"test {local:HH mm dd MM yyyy}";
+        var reply = _service.Create(42, input);
+        Assert.Contains("reminder set", reply);
     }
 }

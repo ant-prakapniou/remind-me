@@ -172,4 +172,10 @@ static async Task HandleMessage(
     {
         await bot.SendMessage(chatId: userId, text: Messages.ParseError);
     }
+    catch (ReminderInPastException ex)
+    {
+        await bot.SendMessage(
+            chatId: userId,
+            text: Messages.ReminderInPast(ex.LocalDateTime.ToString("yyyy-MM-dd HH:mm")));
+    }
 }
