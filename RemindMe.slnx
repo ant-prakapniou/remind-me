@@ -4,4 +4,7 @@
     <Project Path="src/RemindMe.Core/RemindMe.Core.csproj" />
     <Project Path="src/RemindMe.Cron/RemindMe.Cron.csproj" />
   </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/RemindMe.Tests/RemindMe.Tests.csproj" />
+  </Folder>
 </Solution>
