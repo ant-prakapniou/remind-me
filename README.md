@@ -15,6 +15,7 @@ Built as a personal project: small, understandable, easy to modify. No database,
 - **Past-date protection** — reminders set in the past are rejected with a clear message.
 - **Commands** — `/start`, `/help`, `/privacy`, `/allow <userId>`.
 - **UTC storage, local display** — times are stored in UTC, shown in the user's local zone (configurable offset).
+- **Resilient to Telegram outages** — transient 5xx/429 errors are retried with backoff; a single failed update or reminder never kills the bot.
 
 ---
 
@@ -26,6 +27,9 @@ The solution has two active projects (plus tests):
 |---|---|
 | `RemindMe.Core` | Domain logic: parsing, storage, services. No Telegram dependency. |
 | `RemindMe.Bot` | Telegram bot: receives messages, handles commands and approval callbacks. **Also hosts the reminder delivery loop** via `CronRunner` (runs every minute inside the bot process). |
+
+The bot's Telegram calls go through `TelegramApiRetry` (a small static helper
+in `RemindMe.Bot`), which isolates retry/backoff policy from the handlers.
 
 Three JSON files live on a mounted volume (Railway /data):
 
@@ -161,6 +165,16 @@ dotnet run --project src/RemindMe.Bot
 dotnet test
 ```
 
+Tests run on **Microsoft.Testing.Platform** (xunit.v3), not VSTest. The
+`global.json` at the repository root opts `dotnet test` into the new runner;
+without it, .NET 10/11 SDK refuses to run MTP-based test projects. Do not
+remove `global.json` and do not add `Microsoft.NET.Test.Sdk` or
+`xunit.runner.visualstudio` back — they belong to the legacy VSTest path.
+
+`ReminderService` takes a `TimeProvider` (defaults to `TimeProvider.System`),
+and the tests inject `FakeTimeProvider` with a fixed "now" so past-tolerance
+checks are deterministic.
+
 ---
 
 ## Deployment (Railway)
@@ -180,6 +194,12 @@ Railway dashboard and attached to the `bot` service.
 Reminders are delivered with a tolerance of **up to ~1 minute**, limited by
 the timer interval.
 
+> **Note:** Railway may sleep idle containers on some plans. If the bot stops
+> responding after a period of inactivity, check the service's sleep setting in
+> the dashboard and disable it, or add a healthcheck endpoint. The retry logic
+> in `TelegramApiRetry` handles transient 502s during cold start, but it cannot
+> wake a stopped container.
+
 ---
 
 ## Development notes
@@ -191,6 +211,13 @@ the timer interval.
 - **Cron runs inside the bot.** `CronRunner.RunOnceAsync` is called every minute
   by a `PeriodicTimer` in `Program.cs`. It has no `Environment.Exit`, and all
   exceptions are caught so a failed delivery does not kill the bot.
+- **Telegram calls are retried, not fatal.** `TelegramApiRetry` wraps every
+  Telegram API call (`GetMe`, `GetUpdates`, `SendMessage`, callback answers).
+  It retries 5xx, 429 (honouring `retry_after`) and network timeouts with
+  exponential backoff and jitter. If `GetUpdates` still fails after retries,
+  the polling loop backs off and continues instead of exiting. This is why the
+  bot survived the original `502 Bad Gateway` incident only after this change —
+  before it, a single 502 killed the process and Railway kept restarting it.
 
 ---
 
