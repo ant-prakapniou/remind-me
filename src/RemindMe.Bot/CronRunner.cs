@@ -49,7 +49,12 @@ public sealed class CronRunner
     /// Reads all notes, selects those with <see cref="Note.RemindAtUtc"/> less
     /// than or equal to <see cref="DateTime.UtcNow"/>, sends each one, and
     /// removes successfully sent notes from the store. Notes that fail to send
-    /// (e.g. rate limit, blocked bot) are kept and retried on the next tick.
+    /// (e.g. blocked bot) are kept and retried on the next tick.
+    /// </para>
+    /// <para>
+    /// Transient Telegram errors (5xx, 429, network timeouts) are retried
+    /// in-place via <see cref="TelegramApiRetry"/>, so a brief Telegram outage
+    /// does not delay a reminder by a full tick.
     /// </para>
     /// <para>
     /// If there are no due reminders, logs <c>[INFO] No due reminders.</c>
@@ -79,16 +84,27 @@ public sealed class CronRunner
 
                 try
                 {
-                    await _bot.SendMessage(chatId: note.OwnerUserId, text: text);
+                    // Retries transient errors (5xx/429/timeouts) in-place.
+                    // Throws only after maxAttempts are exhausted.
+                    await TelegramApiRetry.ExecuteAsync(
+                        "SendMessage(reminder)",
+                        ct => _bot.SendMessage(chatId: note.OwnerUserId, text: text, cancellationToken: ct),
+                        maxAttempts: 5,
+                        CancellationToken.None);
+
                     sentIds.Add(note.Id);
                     Console.WriteLine($"[INFO] Sent note {note.Id} to {note.OwnerUserId}");
                 }
                 catch (ApiRequestException ex) when (ex.ErrorCode == 429)
                 {
+                    // Telegram rate-limited us even after retries. Keep the note;
+                    // the next tick will try again.
                     Console.WriteLine($"[WARN] Rate limited on note {note.Id}, will retry next run: {ex.Message}");
                 }
                 catch (Exception ex)
                 {
+                    // Non-transient (e.g. blocked bot) or retries exhausted.
+                    // Keep the note so it is retried on the next tick.
                     Console.WriteLine($"[WARN] Failed to send note {note.Id}: {ex.Message}");
                 }
             }

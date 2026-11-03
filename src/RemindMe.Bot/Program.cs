@@ -39,78 +39,140 @@ if (!approvalService.IsApproved(bootstrapAdminId))
 
 var cronRunner = new CronRunner(noteStore, localTime, bot);
 
-var me = await bot.GetMe();
+// Startup: GetMe with retry, since Telegram occasionally returns 502 on cold start.
+// If GetMe still fails after retries, the exception propagates and Railway will
+// restart the container — which is correct, because a bot without a verified
+// identity cannot serve anyone.
+var me = await TelegramApiRetry.ExecuteAsync(
+    "GetMe",
+    ct => bot.GetMe(ct),
+    maxAttempts: 8,
+    CancellationToken.None);
 Console.WriteLine($"[INFO] Bot started: @{me.Username}");
 
-// Start cron loop: run once every 5 minutes
+// Start cron loop: run once every minute.
+// Failures inside RunOnceAsync are caught by CronRunner itself; the outer
+// try/catch is a last line of defence so the background task never dies.
 _ = Task.Run(async () =>
 {
     using var timer = new PeriodicTimer(TimeSpan.FromMinutes(1));
     while (await timer.WaitForNextTickAsync())
     {
         Console.WriteLine("[INFO] Cron tick.");
-        await cronRunner.RunOnceAsync();
+        try
+        {
+            await cronRunner.RunOnceAsync();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[ERROR] Cron run failed: {ex}");
+        }
     }
 });
 
+// Long-polling loop. Transient failures on GetUpdates are retried in-place;
+// if retries are exhausted, the loop backs off and tries again instead of
+// letting the process die. A single bad update is logged and skipped.
 var offset = 0;
 while (true)
 {
-    var updates = await bot.GetUpdates(offset: offset, timeout: 30);
+    Update[] updates;
+    try
+    {
+        updates = await TelegramApiRetry.ExecuteAsync(
+            "GetUpdates",
+            ct => bot.GetUpdates(offset: offset, timeout: 30, cancellationToken: ct),
+            maxAttempts: 5,
+            CancellationToken.None);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[WARN] GetUpdates failed after retries: {ex.Message}. Backing off 10s...");
+        await Task.Delay(TimeSpan.FromSeconds(10));
+        continue;
+    }
+
     foreach (var update in updates)
     {
         offset = update.Id + 1;
 
-        if (update.CallbackQuery is { } callback)
+        try
         {
-            await HandleCallback(bot, approvalService, bootstrapAdminId, callback);
-            continue;
-        }
-
-        if (update.Message is not { From: { } from, Text: { } text }) continue;
-
-        if (!approvalService.IsApproved(from.Id))
-        {
-            await HandleNewUser(bot, approvalService, bootstrapAdminId, from.Id, text);
-            continue;
-        }
-
-        if (text == "/start")
-        {
-            await bot.SendMessage(from.Id, Messages.Start);
-            continue;
-        }
-
-        if (text == "/help")
-        {
-            await bot.SendMessage(from.Id, Messages.Help);
-            continue;
-        }
-
-        if (text == "/privacy")
-        {
-            await bot.SendMessage(from.Id, Messages.Privacy);
-            continue;
-        }
-
-        if (from.Id == bootstrapAdminId && text.StartsWith("/allow ", StringComparison.Ordinal))
-        {
-            if (long.TryParse(text[7..].Trim(), out var newId))
+            if (update.CallbackQuery is { } callback)
             {
-                approvalService.Approve(newId);
-                await bot.SendMessage(from.Id, Messages.ApprovedUser(newId));
+                await HandleCallback(bot, approvalService, bootstrapAdminId, callback);
+                continue;
             }
-            else
-            {
-                await bot.SendMessage(from.Id, Messages.AllowUsage);
-            }
-            continue;
-        }
 
-        await HandleMessage(bot, reminderService, from.Id, text);
+            if (update.Message is not { From: { } from, Text: { } text }) continue;
+
+            if (!approvalService.IsApproved(from.Id))
+            {
+                await HandleNewUser(bot, approvalService, bootstrapAdminId, from.Id, text);
+                continue;
+            }
+
+            if (text == "/start")
+            {
+                await Send(bot, from.Id, Messages.Start);
+                continue;
+            }
+
+            if (text == "/help")
+            {
+                await Send(bot, from.Id, Messages.Help);
+                continue;
+            }
+
+            if (text == "/privacy")
+            {
+                await Send(bot, from.Id, Messages.Privacy);
+                continue;
+            }
+
+            if (from.Id == bootstrapAdminId && text.StartsWith("/allow ", StringComparison.Ordinal))
+            {
+                if (long.TryParse(text[7..].Trim(), out var newId))
+                {
+                    approvalService.Approve(newId);
+                    await Send(bot, from.Id, Messages.ApprovedUser(newId));
+                }
+                else
+                {
+                    await Send(bot, from.Id, Messages.AllowUsage);
+                }
+                continue;
+            }
+
+            await HandleMessage(bot, reminderService, from.Id, text);
+        }
+        catch (Exception ex)
+        {
+            // One bad update must not kill the polling loop.
+            Console.WriteLine($"[ERROR] Failed to handle update {update.Id}: {ex}");
+        }
     }
 }
 
+// --- Helpers -------------------------------------------------------------
+
+/// <summary>
+/// Sends a text message with transient-error retry.
+/// </summary>
+/// <param name="bot">Telegram client.</param>
+/// <param name="chatId">Target chat.</param>
+/// <param name="text">Message body.</param>
+static Task Send(TelegramBotClient bot, long chatId, string text) =>
+    TelegramApiRetry.ExecuteAsync(
+        "SendMessage",
+        ct => bot.SendMessage(chatId: chatId, text: text, cancellationToken: ct),
+        maxAttempts: 4,
+        CancellationToken.None);
+
+/// <summary>
+/// Handles a message from an unapproved user: notifies the admin with
+/// approve/reject buttons and tells the user they are waiting for approval.
+/// </summary>
 static async Task HandleNewUser(
     TelegramBotClient bot,
     ApprovalService approval,
@@ -129,15 +191,24 @@ static async Task HandleNewUser(
             }
         });
 
-        await bot.SendMessage(
-            chatId: adminId,
-            text: Messages.ApprovalRequest(userId, text),
-            replyMarkup: keyboard);
+        await TelegramApiRetry.ExecuteAsync(
+            "SendMessage(approval request)",
+            ct => bot.SendMessage(
+                chatId: adminId,
+                text: Messages.ApprovalRequest(userId, text),
+                replyMarkup: keyboard,
+                cancellationToken: ct),
+            maxAttempts: 4,
+            CancellationToken.None);
     }
 
-    await bot.SendMessage(chatId: userId, text: Messages.WaitingApproval);
+    await Send(bot, userId, Messages.WaitingApproval);
 }
 
+/// <summary>
+/// Handles an inline-keyboard callback from the bootstrap admin, applying
+/// approve/reject decisions and updating the admin's message to remove the buttons.
+/// </summary>
 static async Task HandleCallback(
     TelegramBotClient bot,
     ApprovalService approval,
@@ -156,21 +227,41 @@ static async Task HandleCallback(
     if (action == "approve")
     {
         approval.Approve(targetId);
-        await bot.SendMessage(targetId, Messages.Approved);
-        await bot.AnswerCallbackQuery(callback.Id, $"Approved {targetId}");
+        await Send(bot, targetId, Messages.Approved);
+        await TelegramApiRetry.ExecuteAsync(
+            "AnswerCallbackQuery",
+            ct => bot.AnswerCallbackQuery(callback.Id, $"Approved {targetId}", cancellationToken: ct),
+            maxAttempts: 4,
+            CancellationToken.None);
         if (callback.Message is { } msg)
-            await bot.EditMessageReplyMarkup(msg.Chat.Id, msg.MessageId);
+            await TelegramApiRetry.ExecuteAsync(
+                "EditMessageReplyMarkup",
+                ct => bot.EditMessageReplyMarkup(msg.Chat.Id, msg.MessageId, cancellationToken: ct),
+                maxAttempts: 4,
+                CancellationToken.None);
     }
     else if (action == "reject")
     {
         approval.Reject(targetId);
-        await bot.SendMessage(targetId, Messages.Rejected);
-        await bot.AnswerCallbackQuery(callback.Id, $"Rejected {targetId}");
+        await Send(bot, targetId, Messages.Rejected);
+        await TelegramApiRetry.ExecuteAsync(
+            "AnswerCallbackQuery",
+            ct => bot.AnswerCallbackQuery(callback.Id, $"Rejected {targetId}", cancellationToken: ct),
+            maxAttempts: 4,
+            CancellationToken.None);
         if (callback.Message is { } msg)
-            await bot.EditMessageReplyMarkup(msg.Chat.Id, msg.MessageId);
+            await TelegramApiRetry.ExecuteAsync(
+                "EditMessageReplyMarkup",
+                ct => bot.EditMessageReplyMarkup(msg.Chat.Id, msg.MessageId, cancellationToken: ct),
+                maxAttempts: 4,
+                CancellationToken.None);
     }
 }
 
+/// <summary>
+/// Handles a text message from an approved user: parses it as a reminder,
+/// stores it, and reports either the stored reminder or a user-facing error.
+/// </summary>
 static async Task HandleMessage(
     TelegramBotClient bot,
     ReminderService reminderService,
@@ -180,16 +271,17 @@ static async Task HandleMessage(
     try
     {
         var reply = reminderService.Create(userId, input);
-        await bot.SendMessage(chatId: userId, text: reply);
+        await Send(bot, userId, reply);
     }
     catch (FormatException)
     {
-        await bot.SendMessage(chatId: userId, text: Messages.ParseError);
+        await Send(bot, userId, Messages.ParseError);
     }
     catch (ReminderInPastException ex)
     {
-        await bot.SendMessage(
-            chatId: userId,
-            text: Messages.ReminderInPast(ex.LocalDateTime.ToString("yyyy-MM-dd HH:mm")));
+        await Send(
+            bot,
+            userId,
+            Messages.ReminderInPast(ex.LocalDateTime.ToString("yyyy-MM-dd HH:mm")));
     }
 }
