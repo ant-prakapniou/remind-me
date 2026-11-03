@@ -16,6 +16,11 @@
 /// for delivering the returned string and for catching the exceptions below.
 /// This separation makes the service testable without Telegram.
 /// </para>
+/// <para>
+/// Time is obtained via <see cref="TimeProvider"/>. In production the
+/// parameterless constructor uses <see cref="TimeProvider.System"/>; tests
+/// inject a <c>FakeTimeProvider</c> to make past-tolerance checks deterministic.
+/// </para>
 /// </remarks>
 public sealed class ReminderService
 {
@@ -32,16 +37,31 @@ public sealed class ReminderService
 
     private readonly NoteStore _store;
     private readonly LocalTime _localTime;
+    private readonly TimeProvider _time;
 
     /// <summary>
-    /// Initializes a new instance of the <see cref="ReminderService"/> class.
+    /// Initializes a new instance of the <see cref="ReminderService"/> class
+    /// using the system clock.
     /// </summary>
     /// <param name="store">The store used to persist notes.</param>
     /// <param name="localTime">The converter between the user's local time and UTC.</param>
     public ReminderService(NoteStore store, LocalTime localTime)
+        : this(store, localTime, TimeProvider.System)
+    {
+    }
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="ReminderService"/> class
+    /// with an explicit time provider. Intended for tests.
+    /// </summary>
+    /// <param name="store">The store used to persist notes.</param>
+    /// <param name="localTime">The converter between the user's local time and UTC.</param>
+    /// <param name="time">The time provider used to obtain the current UTC time.</param>
+    public ReminderService(NoteStore store, LocalTime localTime, TimeProvider time)
     {
         _store = store;
         _localTime = localTime;
+        _time = time;
     }
 
     /// <summary>
@@ -70,8 +90,9 @@ public sealed class ReminderService
     {
         var (text, dtLocal) = DateTimeTailParser.Parse(input);
         var dtUtc = _localTime.ToUtc(dtLocal);
+        var nowUtc = _time.GetUtcNow().UtcDateTime;
 
-        if (dtUtc < DateTime.UtcNow - PastTolerance)
+        if (dtUtc < nowUtc - PastTolerance)
             throw new ReminderInPastException(dtLocal);
 
         var note = new Note
