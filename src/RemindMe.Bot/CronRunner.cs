@@ -46,15 +46,30 @@ public sealed class CronRunner
     /// </summary>
     /// <remarks>
     /// <para>
-    /// Reads all notes, selects those with <see cref="Note.RemindAtUtc"/> less
-    /// than or equal to <see cref="DateTime.UtcNow"/>, sends each one, and
-    /// removes successfully sent notes from the store. Notes that fail to send
-    /// (e.g. blocked bot) are kept and retried on the next tick.
+    /// Delivery is two-phase:
+    /// <list type="number">
+    ///   <item><description>
+    ///     <b>Read phase.</b> Under the store's lock, load the current notes
+    ///     and select those with <see cref="Note.RemindAtUtc"/> less than or
+    ///     equal to <see cref="DateTime.UtcNow"/>. The selected notes are
+    ///     <i>not</i> removed yet.
+    ///   </description></item>
+    ///   <item><description>
+    ///     <b>Send phase.</b> Outside the lock, send each due note via Telegram.
+    ///     This may take seconds (network, retries) and must not block other
+    ///     writers of the store (the bot creating new notes).
+    ///   </description></item>
+    ///   <item><description>
+    ///     <b>Remove phase.</b> Under the lock again, remove from storage only
+    ///     the notes that were successfully sent.
+    ///   </description></item>
+    /// </list>
     /// </para>
     /// <para>
-    /// Transient Telegram errors (5xx, 429, network timeouts) are retried
-    /// in-place via <see cref="TelegramApiRetry"/>, so a brief Telegram outage
-    /// does not delay a reminder by a full tick.
+    /// Notes that fail to send (e.g. blocked bot, permanent 4xx) are kept and
+    /// retried on the next tick. Transient Telegram errors (5xx, 429, network
+    /// timeouts) are retried in-place via <see cref="TelegramApiRetry"/>, so a
+    /// brief Telegram outage does not delay a reminder by a full tick.
     /// </para>
     /// <para>
     /// If there are no due reminders, logs <c>[INFO] No due reminders.</c>
@@ -65,9 +80,13 @@ public sealed class CronRunner
     {
         try
         {
-            var notes = _store.Load();
-            var now = DateTime.UtcNow;
-            var due = notes.Where(n => n.RemindAtUtc <= now).ToList();
+            // Phase 1: read due notes under the lock. No I/O with Telegram here.
+            List<Note> due = [];
+            _store.Update(notes =>
+            {
+                var now = DateTime.UtcNow;
+                due = notes.Where(n => n.RemindAtUtc <= now).ToList();
+            });
 
             if (due.Count == 0)
             {
@@ -75,6 +94,7 @@ public sealed class CronRunner
                 return;
             }
 
+            // Phase 2: send outside the lock. Telegram calls can take seconds.
             var sentIds = new HashSet<string>();
 
             foreach (var note in due)
@@ -109,10 +129,10 @@ public sealed class CronRunner
                 }
             }
 
+            // Phase 3: remove successfully sent notes under the lock.
             if (sentIds.Count > 0)
             {
-                notes.RemoveAll(n => sentIds.Contains(n.Id));
-                _store.Save(notes);
+                _store.Update(notes => notes.RemoveAll(n => sentIds.Contains(n.Id)));
             }
         }
         catch (Exception ex)

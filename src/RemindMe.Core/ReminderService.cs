@@ -21,6 +21,10 @@
 /// parameterless constructor uses <see cref="TimeProvider.System"/>; tests
 /// inject a <c>FakeTimeProvider</c> to make past-tolerance checks deterministic.
 /// </para>
+/// <para>
+/// Note creation goes through <see cref="NoteStore.Update(Action{List{Note}})"/>,
+/// so the read-modify-write cycle is atomic with respect to the cron loop.
+/// </para>
 /// </remarks>
 public sealed class ReminderService
 {
@@ -103,9 +107,9 @@ public sealed class ReminderService
             RemindAtUtc = dtUtc
         };
 
-        var notes = _store.Load();
-        notes.Add(note);
-        _store.Save(notes);
+        // Atomic read-modify-write: the cron loop cannot interleave between
+        // reading the current notes and saving the new one.
+        _store.Update(notes => notes.Add(note));
 
         var when = dtLocal.ToString("yyyy-MM-dd HH:mm");
         return Messages.ReminderSet(note.Text, when);

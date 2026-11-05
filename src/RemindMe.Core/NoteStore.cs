@@ -20,11 +20,21 @@ namespace RemindMe.Core;
 /// left behind — it will be overwritten on the next successful save.
 /// </para>
 /// <para>
-/// The store is not thread-safe. It assumes a single writer at a time,
-/// which holds for the current deployment: the bot writes notes when users
-/// create them, and the cron job writes notes after sending them. The two
-/// services do not run concurrently by design (cron completes before the
-/// next scheduled run).
+/// The store is <b>thread-safe</b>. All access to the underlying file is
+/// serialized by an internal monitor (<see cref="lock(object)"/>), and the
+/// read-modify-write cycle is exposed as a single atomic operation via
+/// <see cref="Update(Action{List{Note}})"/>. This matters because the bot
+/// has two concurrent writers in one process: the polling loop (user
+/// creates a note) and the cron loop (delivers and removes due notes).
+/// Without synchronization, a <see cref="Save"/> from one writer could
+/// overwrite a note added by the other.
+/// </para>
+/// <para>
+/// <see cref="Load"/> and <see cref="Save"/> remain public and individually
+/// synchronized. Prefer <see cref="Update(Action{List{Note}})"/> whenever the
+/// caller needs to read, modify, and write back — using <see cref="Load"/>
+/// followed by <see cref="Save"/> is not atomic and can lose concurrent
+/// updates.
 /// </para>
 /// </remarks>
 /// <param name="filePath">
@@ -42,6 +52,7 @@ public sealed class NoteStore(string filePath)
     };
 
     private readonly string _filePath = filePath;
+    private readonly object _sync = new();
 
     /// <summary>
     /// Loads all notes from the file.
@@ -59,10 +70,10 @@ public sealed class NoteStore(string filePath)
     /// </exception>
     public List<Note> Load()
     {
-        if (!File.Exists(_filePath)) return [];
-        var json = File.ReadAllText(_filePath);
-        if (string.IsNullOrWhiteSpace(json)) return new List<Note>();
-        return JsonSerializer.Deserialize<List<Note>>(json, JsonOpts) ?? [];
+        lock (_sync)
+        {
+            return LoadCore();
+        }
     }
 
     /// <summary>
@@ -78,6 +89,11 @@ public sealed class NoteStore(string filePath)
     /// <para>
     /// If the parent directory does not exist, it is created.
     /// </para>
+    /// <para>
+    /// Prefer <see cref="Update(Action{List{Note}})"/> when the write is part
+    /// of a read-modify-write cycle: <see cref="Load"/> followed by
+    /// <see cref="Save"/> is not atomic and can overwrite a concurrent update.
+    /// </para>
     /// </remarks>
     /// <exception cref="IOException">
     /// The temporary file cannot be written, or the move fails
@@ -87,6 +103,65 @@ public sealed class NoteStore(string filePath)
     /// The process lacks permission to write to the target directory.
     /// </exception>
     public void Save(List<Note> notes)
+    {
+        lock (_sync)
+        {
+            SaveCore(notes);
+        }
+    }
+
+    /// <summary>
+    /// Atomically reads the notes, applies <paramref name="mutate"/>, and saves the result.
+    /// </summary>
+    /// <param name="mutate">
+    /// A delegate that receives the current note list and modifies it in place.
+    /// It is called while the store's internal lock is held, so it must be
+    /// fast and must not perform I/O (in particular, no Telegram calls).
+    /// </param>
+    /// <remarks>
+    /// <para>
+    /// This is the correct way to add, remove, or modify notes. It performs
+    /// <c>Load</c>, <paramref name="mutate"/>, and <c>Save</c> under a single
+    /// lock, so no other writer can interleave between the read and the write.
+    /// </para>
+    /// <para>
+    /// The delegate must not call <see cref="Load"/>, <see cref="Save"/>, or
+    /// <see cref="Update(Action{List{Note}})"/> on the same store — the lock
+    /// is not reentrant across <see cref="Thread"/> boundaries in the general
+    /// case, and nested calls would deadlock on some runtimes. Read or write
+    /// only through the provided list.
+    /// </para>
+    /// </remarks>
+    /// <exception cref="JsonException">See <see cref="Load"/>.</exception>
+    /// <exception cref="IOException">See <see cref="Save"/>.</exception>
+    /// <exception cref="UnauthorizedAccessException">See <see cref="Save"/>.</exception>
+    public void Update(Action<List<Note>> mutate)
+    {
+        ArgumentNullException.ThrowIfNull(mutate);
+
+        lock (_sync)
+        {
+            var notes = LoadCore();
+            mutate(notes);
+            SaveCore(notes);
+        }
+    }
+
+    /// <summary>
+    /// Loads notes without taking the lock. Callers must already hold <see cref="_sync"/>.
+    /// </summary>
+    private List<Note> LoadCore()
+    {
+        if (!File.Exists(_filePath)) return [];
+        var json = File.ReadAllText(_filePath);
+        if (string.IsNullOrWhiteSpace(json)) return [];
+        return JsonSerializer.Deserialize<List<Note>>(json, JsonOpts) ?? [];
+    }
+
+    /// <summary>
+    /// Saves notes without taking the lock. Callers must already hold <see cref="_sync"/>.
+    /// </summary>
+    private void SaveCore(List<Note> notes)
     {
         var dir = Path.GetDirectoryName(_filePath);
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);

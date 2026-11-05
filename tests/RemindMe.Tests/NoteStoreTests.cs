@@ -75,6 +75,79 @@ public class NoteStoreTests : IDisposable
         }
     }
 
+    [Fact]
+    public void Update_AppliesMutation_AndPersists()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"notes_{Guid.NewGuid():N}.json");
+        try
+        {
+            var store = new NoteStore(path);
+            var note = new Note
+            {
+                Id = "abc12345",
+                OwnerUserId = 42,
+                Text = "test",
+                RemindAtUtc = DateTime.UtcNow.AddHours(1)
+            };
+
+            store.Update(notes => notes.Add(note));
+
+            var loaded = store.Load();
+            Assert.Single(loaded);
+            Assert.Equal("abc12345", loaded[0].Id);
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Update_ConcurrentAdds_AreNotLost()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"notes_{Guid.NewGuid():N}.json");
+        try
+        {
+            var store = new NoteStore(path);
+            var start = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var ct = TestContext.Current.CancellationToken;
+
+            var t1 = Task.Run(async () =>
+            {
+                await start.Task.WaitAsync(ct);
+                store.Update(notes => notes.Add(new Note
+                {
+                    Id = "aaa11111",
+                    OwnerUserId = 1,
+                    Text = "one",
+                    RemindAtUtc = DateTime.UtcNow.AddHours(1)
+                }));
+            }, ct);
+
+            var t2 = Task.Run(async () =>
+            {
+                await start.Task.WaitAsync(ct);
+                store.Update(notes => notes.Add(new Note
+                {
+                    Id = "bbb22222",
+                    OwnerUserId = 2,
+                    Text = "two",
+                    RemindAtUtc = DateTime.UtcNow.AddHours(1)
+                }));
+            }, ct);
+
+            start.SetResult(); // release both workers simultaneously
+            await Task.WhenAll(t1, t2);
+
+            var loaded = store.Load();
+            Assert.Equal(2, loaded.Count);
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
     private static Note MakeNote(string id) => new()
     {
         Id = id,
