@@ -23,6 +23,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\..\src\RemindMe.Bot\RemindMe.Bot.csproj" />
     <ProjectReference Include="..\..\src\RemindMe.Core\RemindMe.Core.csproj" />
   </ItemGroup>
 

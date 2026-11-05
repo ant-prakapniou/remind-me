@@ -37,7 +37,7 @@ var bot = new TelegramBotClient(botToken);
 if (!approvalService.IsApproved(bootstrapAdminId))
     approvalService.Approve(bootstrapAdminId);
 
-var cronRunner = new CronRunner(noteStore, localTime, bot);
+var cronRunner = new CronRunner(noteStore, localTime, new TelegramSender(bot));
 
 // Startup: GetMe with retry, since Telegram occasionally returns 502 on cold start.
 // If GetMe still fails after retries, the exception propagates and Railway will

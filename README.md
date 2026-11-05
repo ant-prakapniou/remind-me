@@ -16,6 +16,7 @@ Built as a personal project: small, understandable, easy to modify. No database,
 - **Commands** — `/start`, `/help`, `/privacy`, `/allow <userId>`.
 - **UTC storage, local display** — times are stored in UTC, shown in the user's local zone (configurable offset).
 - **Resilient to Telegram outages** — transient 5xx/429 errors are retried with backoff; a single failed update or reminder never kills the bot.
+- **No dead notes** — reminders permanently rejected by Telegram (400/403: chat not found, bot blocked) are dropped instead of retried forever.
 
 ---
 
@@ -30,6 +31,10 @@ The solution has two active projects (plus tests):
 
 The bot's Telegram calls go through `TelegramApiRetry` (a small static helper
 in `RemindMe.Bot`), which isolates retry/backoff policy from the handlers.
+`CronRunner` talks to Telegram through `ITelegramSender` (a one-method
+interface with a `TelegramSender` adapter over `TelegramBotClient`), so the
+delivery policy — sent / dropped / kept — is unit-tested with a fake sender
+instead of a live bot.
 
 Three JSON files live on a mounted volume (Railway /data):
 
@@ -175,6 +180,12 @@ remove `global.json` and do not add `Microsoft.NET.Test.Sdk` or
 and the tests inject `FakeTimeProvider` with a fixed "now" so past-tolerance
 checks are deterministic.
 
+`CronRunner` takes an `ITelegramSender` and an optional `maxSendAttempts`
+(default 5). Tests pass a `FakeSender` and `maxSendAttempts: 1`, so the
+delivery-policy tests run instantly instead of waiting through the real retry
+backoff. `RemindMe.Bot.csproj` declares `<InternalsVisibleTo Include="RemindMe.Tests" />`
+so tests can reach the internal `CronRunner.IsPermanentDeliveryFailure` classifier.
+
 ---
 
 ## Deployment (Railway)
@@ -211,6 +222,19 @@ the timer interval.
 - **Cron runs inside the bot.** `CronRunner.RunOnceAsync` is called every minute
   by a `PeriodicTimer` in `Program.cs`. It has no `Environment.Exit`, and all
   exceptions are caught so a failed delivery does not kill the bot.
+- **Delivery policy.** A due note is removed from storage if Telegram accepts
+  it **or** permanently rejects it (400/403: chat not found, bot blocked,
+  message too long). Transient failures (429, 5xx after retries, network)
+  keep the note for the next tick. This prevents dead notes from accumulating
+  in `notes.json` and spamming the log every minute.
+- **`NoteStore` is thread-safe.** The bot has two concurrent writers in one
+  process — the polling loop (user creates a note) and the cron loop
+  (delivers and removes due notes). `NoteStore` serializes `Load`/`Save` with
+  an internal lock, and read-modify-write cycles go through
+  `NoteStore.Update(Action<List<Note>>)`, which is atomic. `ReminderService.Create`
+  and `CronRunner.RunOnceAsync` both use it. `JsonLongSetStore` is intentionally
+  left unsynchronized: the cron loop never touches `users.json` or `pending.json`,
+  so the polling loop is the only writer.
 - **Telegram calls are retried, not fatal.** `TelegramApiRetry` wraps every
   Telegram API call (`GetMe`, `GetUpdates`, `SendMessage`, callback answers).
   It retries 5xx, 429 (honouring `retry_after`) and network timeouts with

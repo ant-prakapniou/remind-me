@@ -1,5 +1,4 @@
 ﻿using RemindMe.Core;
-using Telegram.Bot;
 using Telegram.Bot.Exceptions;
 
 namespace RemindMe.Bot;
@@ -21,25 +20,19 @@ namespace RemindMe.Bot;
 /// All exceptions are caught and logged so a failed delivery attempt cannot
 /// take down the bot.
 /// </para>
+/// <para>
+/// The primary constructor takes the note store, the local-time converter,
+/// the Telegram sender, and an optional retry limit
+/// (<c>maxSendAttempts</c>, default 5). The limit exists so tests can set
+/// it to 1 and avoid waiting through the real retry backoff.
+/// </para>
 /// </remarks>
-public sealed class CronRunner
+public sealed class CronRunner(NoteStore store, LocalTime localTime, ITelegramSender sender, int maxSendAttempts = 5)
 {
-    private readonly NoteStore _store;
-    private readonly LocalTime _localTime;
-    private readonly TelegramBotClient _bot;
-
-    /// <summary>
-    /// Initializes a new instance of the <see cref="CronRunner"/> class.
-    /// </summary>
-    /// <param name="store">The store used to read and update notes.</param>
-    /// <param name="localTime">Converter between UTC and the user's local time.</param>
-    /// <param name="bot">Telegram client used to deliver reminders.</param>
-    public CronRunner(NoteStore store, LocalTime localTime, TelegramBotClient bot)
-    {
-        _store = store;
-        _localTime = localTime;
-        _bot = bot;
-    }
+    private readonly NoteStore _store = store;
+    private readonly LocalTime _localTime = localTime;
+    private readonly ITelegramSender _sender = sender;
+    private readonly int _maxSendAttempts = maxSendAttempts;
 
     /// <summary>
     /// Sends all reminders whose time has come and removes them from storage.
@@ -60,16 +53,35 @@ public sealed class CronRunner
     ///     writers of the store (the bot creating new notes).
     ///   </description></item>
     ///   <item><description>
-    ///     <b>Remove phase.</b> Under the lock again, remove from storage only
-    ///     the notes that were successfully sent.
+    ///     <b>Remove phase.</b> Under the lock again, remove from storage the
+    ///     notes that were successfully sent, and also the notes that Telegram
+    ///     permanently rejected (see below).
     ///   </description></item>
     /// </list>
     /// </para>
     /// <para>
-    /// Notes that fail to send (e.g. blocked bot, permanent 4xx) are kept and
-    /// retried on the next tick. Transient Telegram errors (5xx, 429, network
-    /// timeouts) are retried in-place via <see cref="TelegramApiRetry"/>, so a
-    /// brief Telegram outage does not delay a reminder by a full tick.
+    /// Delivery outcomes:
+    /// <list type="bullet">
+    ///   <item><description>
+    ///     <b>Sent.</b> Removed from storage.
+    ///   </description></item>
+    ///   <item><description>
+    ///     <b>Permanently rejected</b> — <see cref="ApiRequestException"/>
+    ///     with <c>ErrorCode</c> 400 (chat not found, message too long, etc.)
+    ///     or 403 (bot blocked by the user, bot kicked from the chat).
+    ///     Retrying cannot succeed, so the note is dropped and an
+    ///     <c>[INFO] Dropped note ...</c> line is logged.
+    ///   </description></item>
+    ///   <item><description>
+    ///     <b>Transient failure</b> — 429, 5xx after retries, network errors.
+    ///     The note is kept and retried on the next tick.
+    ///   </description></item>
+    /// </list>
+    /// </para>
+    /// <para>
+    /// Transient Telegram errors (5xx, 429, network timeouts) are retried
+    /// in-place via <see cref="TelegramApiRetry"/>, so a brief Telegram outage
+    /// does not delay a reminder by a full tick.
     /// </para>
     /// <para>
     /// If there are no due reminders, logs <c>[INFO] No due reminders.</c>
@@ -96,6 +108,7 @@ public sealed class CronRunner
 
             // Phase 2: send outside the lock. Telegram calls can take seconds.
             var sentIds = new HashSet<string>();
+            var deadIds = new HashSet<string>();
 
             foreach (var note in due)
             {
@@ -108,8 +121,8 @@ public sealed class CronRunner
                     // Throws only after maxAttempts are exhausted.
                     await TelegramApiRetry.ExecuteAsync(
                         "SendMessage(reminder)",
-                        ct => _bot.SendMessage(chatId: note.OwnerUserId, text: text, cancellationToken: ct),
-                        maxAttempts: 5,
+                        ct => _sender.SendMessageAsync(note.OwnerUserId, text, ct),
+                        maxAttempts: _maxSendAttempts,
                         CancellationToken.None);
 
                     sentIds.Add(note.Id);
@@ -121,18 +134,29 @@ public sealed class CronRunner
                     // the next tick will try again.
                     Console.WriteLine($"[WARN] Rate limited on note {note.Id}, will retry next run: {ex.Message}");
                 }
+                catch (ApiRequestException ex) when (IsPermanentDeliveryFailure(ex.ErrorCode))
+                {
+                    // Permanent rejection: chat does not exist, bot was blocked
+                    // or kicked, message too long, etc. Retrying cannot succeed,
+                    // so drop the note instead of keeping it forever.
+                    deadIds.Add(note.Id);
+                    Console.WriteLine($"[INFO] Dropped note {note.Id} (chat {note.OwnerUserId}, error {ex.ErrorCode}): {ex.Message}");
+                }
                 catch (Exception ex)
                 {
-                    // Non-transient (e.g. blocked bot) or retries exhausted.
-                    // Keep the note so it is retried on the next tick.
+                    // Non-transient (unknown) or retries exhausted on a
+                    // possibly-transient error. Keep the note and retry next tick.
                     Console.WriteLine($"[WARN] Failed to send note {note.Id}: {ex.Message}");
                 }
             }
 
-            // Phase 3: remove successfully sent notes under the lock.
-            if (sentIds.Count > 0)
+            // Phase 3: remove sent and dead notes under the lock.
+            if (sentIds.Count > 0 || deadIds.Count > 0)
             {
-                _store.Update(notes => notes.RemoveAll(n => sentIds.Contains(n.Id)));
+                _store.Update(notes =>
+                {
+                    notes.RemoveAll(n => sentIds.Contains(n.Id) || deadIds.Contains(n.Id));
+                });
             }
         }
         catch (Exception ex)
@@ -140,4 +164,20 @@ public sealed class CronRunner
             Console.WriteLine($"[ERROR] Cron run failed: {ex.Message}");
         }
     }
+
+    /// <summary>
+    /// Returns <c>true</c> if the Telegram error code denotes a permanent
+    /// delivery failure that should not be retried.
+    /// </summary>
+    /// <param name="errorCode">The <see cref="ApiRequestException.ErrorCode"/> from Telegram.</param>
+    /// <returns>
+    /// <c>true</c> for 400 (bad request: chat not found, message too long, etc.)
+    /// and 403 (forbidden: bot blocked or kicked); otherwise <c>false</c>.
+    /// </returns>
+    /// <remarks>
+    /// Kept as a separate internal method so the classification is unit-testable
+    /// without constructing an <see cref="ApiRequestException"/>.
+    /// </remarks>
+    internal static bool IsPermanentDeliveryFailure(int errorCode) =>
+        errorCode is 400 or 403;
 }
